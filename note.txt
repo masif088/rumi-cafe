@@ -1,0 +1,106 @@
+SKEMA FIRESTORE - RUMI CAFE
+(semua dokumen punya created_at & updated_at bertipe Timestamp; id = document id)
+
+customers
+  full_name
+  couple_name
+  no_hp
+  address
+  address_blok
+
+products
+  name
+  category              kategori bebas (Kopi, Non-kopi, Makanan, ...); kosong = "Lainnya"
+  price                 harga jual sekarang
+  history_price[]       [{ price, changed_at }] - isi setiap harga jual berubah
+  hpp                   dihitung dari product_ingredients x ingredients.value
+
+ingredients
+  name
+  unit
+  min_amount            batas minimal stok; stok <= batas -> peringatan "segera beli"
+                        (0/kosong = tanpa peringatan)
+  amount                stok sekarang
+  value                 harga per unit (rata-rata bergerak) = total_value / amount
+  total_value           nilai stok = amount x value
+  last_price            harga per unit pembelian terakhir (info saja)
+
+ingredient_buys
+  ingredient_id
+  price                 TOTAL uang yang dibayar (bukan per unit)
+  amount                jumlah yang dibeli
+  unit_price            price / amount (disimpan biar riwayat mudah dibaca)
+  store
+  -> efek: ingredients.amount += amount, total_value += price,
+           value = total_value / amount, last_price = unit_price
+
+product_ingredients     (resep)
+  product_id
+  ingredient_id
+  amount                jumlah bahan per 1 produk
+
+transactions
+  customer_id           boleh null (pembeli umum)
+  created_at            Timestamp (gabungan date + time, dipakai filter minggu/bulan)
+  payment_method        "cash" | "qris"
+  total                 total tagihan
+  paid                  uang dibayar
+  change                kembalian (paid - total)
+  cost                  modal = sum(ingredient_uses.value); cadangan kalau resep
+                        kosong = sum(details.hpp x amount)
+  profit                laba kotor = total - cost
+                        (transaksi lama tanpa field ini dihitung dari details.hpp)
+  details               map, key = product_id:
+                          { name, price, amount, hpp }   <- snapshot saat transaksi
+  -> efek: buat ingredient_uses untuk tiap bahan resep,
+           ingredients.amount & total_value berkurang
+
+ingredient_uses
+  ingredient_id
+  transaction_id        id transaksi; null kalau penyesuaian manual
+  reason                (hanya manual) terbuang | rusak | dipakai_sendiri |
+                        koreksi_kurang | koreksi_tambah | lainnya
+  note                  (hanya manual) catatan bebas
+  amount                jumlah bahan keluar (negatif = koreksi tambah stok)
+  value                 amount x ingredients.value saat itu
+
+expenses                (pengeluaran operasional, untuk laba bersih)
+  name
+  category              gaji | sewa | listrik_air | gas | kemasan | bahan | lainnya
+  amount
+  note                  keterangan singkat (mis. "100 pcs · Shopee")
+  source                "manual" | "ingredient_buy"
+  ref_id                id ingredient_buys asal (kalau source = ingredient_buy)
+  date                  Timestamp tanggal pengeluaran terjadi
+  -> category "bahan" disalin OTOMATIS saat recordIngredientBuy (id dokumen
+     buy_<id>), jadi halaman Pengeluaran hanya membaca koleksi ini.
+
+daily_stats             (ringkasan PEMASUKAN harian berjalan; id = "yyyy-mm-dd" lokal)
+  date                  Timestamp jam 12 siang hari itu (untuk filter rentang)
+  income                sum(transactions.total)
+  cash / qris           pembagian income per metode bayar
+  cost / profit         modal & laba kotor
+  trx_count             jumlah transaksi
+  -> ditambah dengan increment() di transaksi Firestore yang sama saat
+     createTransaction. Field kosong dianggap 0. Data sebelum fitur ini tidak ikut.
+
+HALAMAN CASH FLOW (/cashflow)
+  Per hari: pemasukan = SATU baris dari daily_stats (sudah dikelompokkan),
+  pengeluaran = tetap rinci per baris dari koleksi expenses.
+
+LABA
+  laba kotor = sum(transactions.profit)
+  (laba bersih belum dipakai; nanti kalau perlu: laba kotor - expenses
+   selain category "bahan", karena pembelian bahan sudah jadi modal)
+
+CATATAN / KEPUTUSAN
+- transactions.product_id dihapus (sudah ada di details).
+- details di-snapshot (name, price, hpp) supaya laporan lama tidak berubah
+  walau harga/HPP produk diganti nanti.
+- Pembaruan lintas dokumen (pembelian, transaksi) wajib lewat runTransaction
+  (lib/db.ts), jangan tulis manual.
+- hpp produk dihitung ulang saat resep berubah atau harga bahan berubah
+  (recomputeProductHpp).
+- Stok boleh minus (transaksi tidak diblokir), nanti bisa diberi peringatan di UI.
+- Saran nanti: Firestore rules (hanya user login), index untuk
+  transactions.created_at.
