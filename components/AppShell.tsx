@@ -113,14 +113,14 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </Toolbar>
       </AppBar>
 
-      <main className="mx-auto w-full max-w-6xl flex-1 px-4 pt-5 pb-28 md:pb-8">
+      <main className="mx-auto w-full max-w-6xl flex-1 px-4 pt-5 pb-[calc(7rem+env(safe-area-inset-bottom))] md:pb-8">
         {children}
       </main>
 
       {/* mobile: navbar bawah */}
       <Paper
         elevation={0}
-        className="fixed inset-x-0 bottom-0 z-10 border-t border-[var(--mui-palette-divider)] md:hidden"
+        className="fixed inset-x-0 bottom-0 z-10 border-t border-[var(--mui-palette-divider)] pb-[env(safe-area-inset-bottom)] md:hidden"
         square
       >
         <BottomNavigation showLabels value={active?.href ?? false}>
