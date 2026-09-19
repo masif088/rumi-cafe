@@ -18,6 +18,12 @@ export interface Customer extends Base, Hideable {
   no_hp: string;
   address: string;
   address_blok: string;
+  // data berjalan, diperbarui otomatis oleh createTransaction (kosong = 0)
+  total_spent?: number;
+  trx_count?: number;
+  last_purchase_at?: Timestamp;
+  /** jumlah beli per produk; key = product_id (untuk "favorit") */
+  product_counts?: Record<string, { name: string; amount: number }>;
 }
 
 export interface PriceHistory {
@@ -84,6 +90,12 @@ export interface Transaction extends Base {
   cost?: number;
   /** laba kotor transaksi: total - cost */
   profit?: number;
+  /** "void" = dibatalkan (stok & ringkasan sudah dikoreksi, data tetap disimpan) */
+  status?: "void";
+  voided_at?: Timestamp;
+  void_reason?: string;
+  /** terakhir diedit (created_at tetap waktu transaksi asli) */
+  edited_at?: Timestamp;
   /** key = product_id */
   details: Record<string, TransactionDetail>;
 }
@@ -151,4 +163,9 @@ export interface DailyStat {
   cost?: number; // modal
   profit?: number; // laba kotor
   trx_count?: number;
+  /**
+   * Pemakaian bahan hari itu per bahan (key = ingredient_id).
+   * manual = bagian dari penyesuaian stok manual (terbuang, koreksi, dll).
+   */
+  uses?: Record<string, { amount: number; value: number; manual: number }>;
 }

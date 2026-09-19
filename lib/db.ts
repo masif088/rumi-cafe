@@ -2,6 +2,7 @@ import {
   addDoc,
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getDoc,
   getDocs,
@@ -13,10 +14,12 @@ import {
   where,
   writeBatch,
   type CollectionReference,
+  type WriteBatch,
 } from "firebase/firestore";
 import { db } from "./firebase";
 import { dayKey } from "./period";
 import type {
+  Customer,
   DailyStat,
   Expense,
   Ingredient,
@@ -48,7 +51,13 @@ export const collections = {
 type DailyField = Exclude<keyof DailyStat, "date" | "updated_at">;
 
 /** Isi set(..., {merge:true}) untuk menambah angka ke ringkasan pemasukan harian. */
-function dailyPatch(d: Date, inc: Partial<Record<DailyField, number>>) {
+type UsesPatch = Record<string, { amount: number; value: number; manual: number }>;
+
+function dailyPatch(
+  d: Date,
+  inc: Partial<Record<Exclude<DailyField, "uses">, number>>,
+  uses?: UsesPatch,
+) {
   const noon = new Date(d);
   noon.setHours(12, 0, 0, 0);
   const patch: Record<string, unknown> = {
@@ -56,6 +65,18 @@ function dailyPatch(d: Date, inc: Partial<Record<DailyField, number>>) {
     updated_at: Timestamp.now(),
   };
   for (const [k, v] of Object.entries(inc)) patch[k] = increment(v as number);
+  if (uses) {
+    patch.uses = Object.fromEntries(
+      Object.entries(uses).map(([id, u]) => [
+        id,
+        {
+          amount: increment(u.amount),
+          value: increment(u.value),
+          manual: increment(u.manual),
+        },
+      ]),
+    );
+  }
   return patch;
 }
 
@@ -229,13 +250,21 @@ export async function createTransaction(input: {
       if (snap.exists()) ingredients.set(id, snap.data() as Ingredient);
     }
 
+    // pelanggan dibaca dulu (semua read sebelum write); bisa saja sudah dihapus
+    const custRef = input.customer_id
+      ? doc(db, collections.customers, input.customer_id)
+      : null;
+    const custSnap = custRef ? await tx.get(custRef) : null;
+
     const now = Timestamp.now();
     let usedCost = 0;
+    const usesPatch: UsesPatch = {};
     for (const [id, used] of usage) {
       const ing = ingredients.get(id);
       if (!ing) continue;
       const value = used * ing.value;
       usedCost += value;
+      usesPatch[id] = { amount: used, value, manual: 0 };
       tx.update(doc(db, collections.ingredients, id), {
         amount: ing.amount - used,
         total_value: ing.total_value - value,
@@ -267,16 +296,40 @@ export async function createTransaction(input: {
     } satisfies Transaction);
     tx.set(
       doc(db, collections.dailyStats, dayKey(now.toDate())),
-      dailyPatch(now.toDate(), {
+      dailyPatch(
+        now.toDate(),
+        {
         income: total,
         cash: input.payment_method === "cash" ? total : 0,
         qris: input.payment_method === "qris" ? total : 0,
         cost,
         profit: total - cost,
         trx_count: 1,
-      }),
+      },
+      usesPatch,
+      ),
       { merge: true },
     );
+
+    // data berjalan pelanggan: total belanja, terakhir beli, favorit
+    if (custRef && custSnap?.exists()) {
+      tx.set(
+        custRef,
+        {
+          total_spent: increment(total),
+          trx_count: increment(1),
+          last_purchase_at: now,
+          updated_at: now,
+          product_counts: Object.fromEntries(
+            Object.entries(details).map(([pid, d]) => [
+              pid,
+              { name: d.name, amount: increment(d.amount) },
+            ]),
+          ),
+        },
+        { merge: true },
+      );
+    }
   });
 
   return trxRef.id;
@@ -409,5 +462,504 @@ export async function adjustIngredientStock(input: {
       created_at: now,
       updated_at: now,
     } satisfies IngredientUse);
+    tx.set(
+      doc(db, collections.dailyStats, dayKey(now.toDate())),
+      dailyPatch(now.toDate(), {}, {
+        [input.ingredient_id]: { amount: used, value, manual: used },
+      }),
+      { merge: true },
+    );
   });
+}
+
+/**
+ * Batalkan transaksi: tandai void, kembalikan stok bahan, koreksi ringkasan harian
+ * dan statistik pelanggan. Datanya tidak dihapus (jadi riwayat).
+ */
+export async function voidTransaction(trxId: string, reason = "") {
+  // pemakaian bahan transaksi ini (query tidak bisa di dalam transaksi Firestore)
+  const usesSnap = await getDocs(
+    query(
+      col<IngredientUse>(collections.ingredientUses),
+      where("transaction_id", "==", trxId),
+    ),
+  );
+  const trxRef = doc(db, collections.transactions, trxId);
+  const ctx = { customerId: null as string | null };
+
+  await runTransaction(db, async (tx) => {
+    // ---- semua read dulu ----
+    const snap = await tx.get(trxRef);
+    if (!snap.exists()) throw new Error("Transaksi tidak ditemukan");
+    const trx = snap.data() as Transaction;
+    if (trx.status === "void") throw new Error("Transaksi sudah dibatalkan");
+    ctx.customerId = trx.customer_id;
+
+    const back = new Map<string, { amount: number; value: number }>();
+    for (const u of usesSnap.docs) {
+      const x = u.data();
+      const cur = back.get(x.ingredient_id) ?? { amount: 0, value: 0 };
+      cur.amount += x.amount;
+      cur.value += x.value;
+      back.set(x.ingredient_id, cur);
+    }
+    const ings = new Map<string, Ingredient>();
+    for (const id of back.keys()) {
+      const s = await tx.get(doc(db, collections.ingredients, id));
+      if (s.exists()) ings.set(id, s.data() as Ingredient);
+    }
+    const custRef = trx.customer_id
+      ? doc(db, collections.customers, trx.customer_id)
+      : null;
+    const custSnap = custRef ? await tx.get(custRef) : null;
+
+    // ---- lalu write ----
+    const now = Timestamp.now();
+    const when = trx.created_at.toDate();
+    const usesPatch: UsesPatch = {};
+    for (const u of usesSnap.docs) tx.delete(u.ref);
+    for (const [id, b] of back) {
+      usesPatch[id] = { amount: -b.amount, value: -b.value, manual: 0 };
+      const ing = ings.get(id);
+      if (!ing) continue;
+      const amount = ing.amount + b.amount;
+      const total_value = ing.total_value + b.value;
+      tx.update(doc(db, collections.ingredients, id), {
+        amount,
+        total_value,
+        value: amount > 0 ? total_value / amount : ing.value,
+        updated_at: now,
+      });
+    }
+
+    tx.update(trxRef, {
+      status: "void",
+      voided_at: now,
+      void_reason: reason,
+      updated_at: now,
+    });
+
+    const cost =
+      trx.cost ??
+      Object.values(trx.details).reduce((sum, d) => sum + d.hpp * d.amount, 0);
+    tx.set(
+      doc(db, collections.dailyStats, dayKey(when)),
+      dailyPatch(
+        when,
+        {
+          income: -trx.total,
+          cash: trx.payment_method === "cash" ? -trx.total : 0,
+          qris: trx.payment_method === "qris" ? -trx.total : 0,
+          cost: -cost,
+          profit: -(trx.profit ?? trx.total - cost),
+          trx_count: -1,
+        },
+        usesPatch,
+      ),
+      { merge: true },
+    );
+
+    if (custRef && custSnap?.exists()) {
+      tx.set(
+        custRef,
+        {
+          total_spent: increment(-trx.total),
+          trx_count: increment(-1),
+          updated_at: now,
+          product_counts: Object.fromEntries(
+            Object.entries(trx.details).map(([pid, d]) => [
+              pid,
+              { name: d.name, amount: increment(-d.amount) },
+            ]),
+          ),
+        },
+        { merge: true },
+      );
+    }
+  });
+
+  if (ctx.customerId) await refreshLastPurchase(ctx.customerId);
+}
+
+/** "Terakhir beli" pelanggan dihitung ulang dari transaksinya yang belum dibatalkan. */
+async function refreshLastPurchase(customerId: string) {
+  const cref = doc(db, collections.customers, customerId);
+  const [cust, rest] = await Promise.all([
+    getDoc(cref),
+    getDocs(
+      query(
+        col<Transaction>(collections.transactions),
+        where("customer_id", "==", customerId),
+      ),
+    ),
+  ]);
+  if (!cust.exists()) return;
+  let last: Timestamp | null = null;
+  for (const d of rest.docs) {
+    const t = d.data();
+    if (t.status === "void") continue;
+    if (!last || t.created_at.toMillis() > last.toMillis()) last = t.created_at;
+  }
+  await updateDoc(cref, { last_purchase_at: last ?? deleteField() });
+}
+
+/**
+ * Bangun ulang semua data turunan dari sumbernya:
+ *  - daily_stats  <- transactions (bukan void) + ingredient_uses
+ *  - statistik pelanggan (total, terakhir beli, favorit) <- transactions
+ * Aman dijalankan kapan saja; hasilnya menimpa angka lama.
+ */
+export async function rebuildStats() {
+  const [trxSnap, usesSnap, dailySnap, custSnap] = await Promise.all([
+    getDocs(col<Transaction>(collections.transactions)),
+    getDocs(col<IngredientUse>(collections.ingredientUses)),
+    getDocs(col<DailyStat>(collections.dailyStats)),
+    getDocs(col<Customer>(collections.customers)),
+  ]);
+
+  type Day = {
+    date: Date;
+    income: number;
+    cash: number;
+    qris: number;
+    cost: number;
+    profit: number;
+    trx_count: number;
+    uses: Record<string, { amount: number; value: number; manual: number }>;
+  };
+  const days = new Map<string, Day>();
+  const dayOf = (d: Date) => {
+    const key = dayKey(d);
+    let day = days.get(key);
+    if (!day) {
+      const noon = new Date(d);
+      noon.setHours(12, 0, 0, 0);
+      day = { date: noon, income: 0, cash: 0, qris: 0, cost: 0, profit: 0, trx_count: 0, uses: {} };
+      days.set(key, day);
+    }
+    return day;
+  };
+
+  type Cust = {
+    total_spent: number;
+    trx_count: number;
+    last: Timestamp | null;
+    product_counts: Record<string, { name: string; amount: number }>;
+  };
+  const custs = new Map<string, Cust>();
+
+  let trxCount = 0;
+  for (const d of trxSnap.docs) {
+    const t = d.data();
+    if (t.status === "void") continue;
+    trxCount++;
+    const cost =
+      t.cost ??
+      Object.values(t.details).reduce((sum, x) => sum + x.hpp * x.amount, 0);
+    const day = dayOf(t.created_at.toDate());
+    day.income += t.total;
+    if (t.payment_method === "cash") day.cash += t.total;
+    else day.qris += t.total;
+    day.cost += cost;
+    day.profit += t.profit ?? t.total - cost;
+    day.trx_count += 1;
+
+    if (t.customer_id) {
+      const c = custs.get(t.customer_id) ?? {
+        total_spent: 0,
+        trx_count: 0,
+        last: null,
+        product_counts: {},
+      };
+      c.total_spent += t.total;
+      c.trx_count += 1;
+      if (!c.last || t.created_at.toMillis() > c.last.toMillis()) c.last = t.created_at;
+      for (const [pid, x] of Object.entries(t.details)) {
+        const pc = c.product_counts[pid] ?? { name: x.name, amount: 0 };
+        pc.amount += x.amount;
+        c.product_counts[pid] = pc;
+      }
+      custs.set(t.customer_id, c);
+    }
+  }
+
+  for (const d of usesSnap.docs) {
+    const u = d.data();
+    const day = dayOf(u.created_at.toDate());
+    const cur = day.uses[u.ingredient_id] ?? { amount: 0, value: 0, manual: 0 };
+    cur.amount += u.amount;
+    cur.value += u.value;
+    if (u.transaction_id === null) cur.manual += u.amount;
+    day.uses[u.ingredient_id] = cur;
+  }
+
+  const now = Timestamp.now();
+  const ops: ((b: WriteBatch) => void)[] = [];
+  for (const [key, day] of days) {
+    ops.push((b) =>
+      b.set(doc(db, collections.dailyStats, key), {
+        date: Timestamp.fromDate(day.date),
+        updated_at: now,
+        income: day.income,
+        cash: day.cash,
+        qris: day.qris,
+        cost: day.cost,
+        profit: day.profit,
+        trx_count: day.trx_count,
+        uses: day.uses,
+      }),
+    );
+  }
+  // ringkasan hari yang ternyata sudah tidak punya data
+  for (const d of dailySnap.docs) if (!days.has(d.id)) ops.push((b) => b.delete(d.ref));
+  for (const d of custSnap.docs) {
+    const c = custs.get(d.id);
+    ops.push((b) =>
+      b.update(d.ref, {
+        total_spent: c?.total_spent ?? 0,
+        trx_count: c?.trx_count ?? 0,
+        last_purchase_at: c?.last ?? deleteField(),
+        product_counts: c?.product_counts ?? {},
+      }),
+    );
+  }
+
+  for (let i = 0; i < ops.length; i += 400) {
+    const batch = writeBatch(db);
+    ops.slice(i, i + 400).forEach((op) => op(batch));
+    await batch.commit();
+  }
+  return { transactions: trxCount, days: days.size, customers: custSnap.size };
+}
+
+/**
+ * Edit transaksi di tempat (waktu asli tetap). Dalam satu transaksi Firestore:
+ * efek lama dibalik (stok, pemakaian bahan, ringkasan harian, statistik pelanggan),
+ * lalu efek baru diterapkan. Baris produk yang sudah ada memakai harga/HPP
+ * snapshot lama; produk yang baru ditambahkan memakai harga sekarang.
+ */
+export async function updateTransaction(
+  trxId: string,
+  input: {
+    customer_id: string | null;
+    payment_method: PaymentMethod;
+    paid: number;
+    /** price (opsional) = harga satuan baru; kosong = pakai harga snapshot/produk */
+    items: { product_id: string; amount: number; price?: number }[];
+  },
+) {
+  const items = input.items.filter((i) => i.amount > 0);
+  if (items.length === 0) throw new Error("Minimal satu item");
+
+  const trxRef = doc(db, collections.transactions, trxId);
+  // ---- baca di luar transaksi Firestore (query tidak didukung di dalamnya) ----
+  const oldSnap = await getDoc(trxRef);
+  if (!oldSnap.exists()) throw new Error("Transaksi tidak ditemukan");
+  const old0 = oldSnap.data() as Transaction;
+  if (old0.status === "void") throw new Error("Transaksi sudah dibatalkan");
+
+  const newProducts = new Map<string, Product>();
+  const recipes = new Map<string, ProductIngredient[]>();
+  for (const { product_id } of items) {
+    if (!old0.details[product_id]) {
+      const p = await getDoc(doc(db, collections.products, product_id));
+      if (!p.exists()) throw new Error(`Produk ${product_id} tidak ditemukan`);
+      newProducts.set(product_id, p.data() as Product);
+    }
+    const r = await getDocs(
+      query(
+        col<ProductIngredient>(collections.productIngredients),
+        where("product_id", "==", product_id),
+      ),
+    );
+    recipes.set(product_id, r.docs.map((d) => d.data()));
+  }
+  const usesSnap = await getDocs(
+    query(
+      col<IngredientUse>(collections.ingredientUses),
+      where("transaction_id", "==", trxId),
+    ),
+  );
+
+  const details: Record<string, TransactionDetail> = {};
+  let total = 0;
+  for (const { product_id, amount, price: override } of items) {
+    const base =
+      old0.details[product_id] ??
+      (() => {
+        const p = newProducts.get(product_id)!;
+        return { name: p.name, price: p.price, hpp: p.hpp, amount: 0 };
+      })();
+    const price = override ?? base.price;
+    details[product_id] = {
+      name: base.name,
+      price,
+      hpp: base.hpp,
+      amount: (details[product_id]?.amount ?? 0) + amount,
+    };
+    total += price * amount;
+  }
+  if (input.paid < total) throw new Error("Uang dibayar kurang dari total");
+  const hppCost = Object.values(details).reduce((s, d) => s + d.hpp * d.amount, 0);
+
+  const ctx = { oldCustomer: null as string | null };
+
+  await runTransaction(db, async (tx) => {
+    // ---- semua read dulu ----
+    const snap = await tx.get(trxRef);
+    if (!snap.exists()) throw new Error("Transaksi tidak ditemukan");
+    const old = snap.data() as Transaction;
+    if (old.status === "void") throw new Error("Transaksi sudah dibatalkan");
+    ctx.oldCustomer = old.customer_id;
+
+    const oldBack = new Map<string, { amount: number; value: number }>();
+    for (const u of usesSnap.docs) {
+      const x = u.data();
+      const cur = oldBack.get(x.ingredient_id) ?? { amount: 0, value: 0 };
+      cur.amount += x.amount;
+      cur.value += x.value;
+      oldBack.set(x.ingredient_id, cur);
+    }
+    const newUsage = new Map<string, number>();
+    for (const [pid, d] of Object.entries(details)) {
+      for (const r of recipes.get(pid) ?? []) {
+        newUsage.set(r.ingredient_id, (newUsage.get(r.ingredient_id) ?? 0) + r.amount * d.amount);
+      }
+    }
+    const ingIds = new Set([...oldBack.keys(), ...newUsage.keys()]);
+    const ings = new Map<string, Ingredient>();
+    for (const id of ingIds) {
+      const s = await tx.get(doc(db, collections.ingredients, id));
+      if (s.exists()) ings.set(id, s.data() as Ingredient);
+    }
+    const custIds = new Set([old.customer_id, input.customer_id].filter(Boolean) as string[]);
+    const custExists = new Map<string, boolean>();
+    for (const id of custIds) {
+      custExists.set(id, (await tx.get(doc(db, collections.customers, id))).exists());
+    }
+
+    // ---- lalu write ----
+    const now = Timestamp.now();
+    const when = old.created_at.toDate();
+    for (const u of usesSnap.docs) tx.delete(u.ref);
+
+    let usedCost = 0;
+    const usesDelta: UsesPatch = {};
+    for (const id of ingIds) {
+      const ing = ings.get(id);
+      const back = oldBack.get(id) ?? { amount: 0, value: 0 };
+      const used = ing ? (newUsage.get(id) ?? 0) : 0;
+      const newValue = ing ? used * ing.value : 0;
+      usedCost += newValue;
+      usesDelta[id] = { amount: used - back.amount, value: newValue - back.value, manual: 0 };
+      if (!ing) continue;
+      const amount = ing.amount + back.amount - used;
+      const total_value = ing.total_value + back.value - newValue;
+      tx.update(doc(db, collections.ingredients, id), {
+        amount,
+        total_value,
+        value: amount > 0 ? total_value / amount : ing.value,
+        updated_at: now,
+      });
+      if (used > 0) {
+        tx.set(doc(collection(db, collections.ingredientUses)), {
+          ingredient_id: id,
+          transaction_id: trxId,
+          amount: used,
+          value: newValue,
+          created_at: old.created_at,
+          updated_at: now,
+        } satisfies IngredientUse);
+      }
+    }
+
+    const cost = usedCost > 0 ? usedCost : hppCost;
+    const oldCost =
+      old.cost ?? Object.values(old.details).reduce((s, d) => s + d.hpp * d.amount, 0);
+    const oldProfit = old.profit ?? old.total - oldCost;
+
+    tx.update(trxRef, {
+      customer_id: input.customer_id,
+      payment_method: input.payment_method,
+      total,
+      paid: input.paid,
+      change: input.paid - total,
+      cost,
+      profit: total - cost,
+      details,
+      edited_at: now,
+      updated_at: now,
+    });
+
+    // ringkasan harian pada tanggal transaksi asli: selisih baru - lama
+    tx.set(
+      doc(db, collections.dailyStats, dayKey(when)),
+      dailyPatch(
+        when,
+        {
+          income: total - old.total,
+          cash:
+            (input.payment_method === "cash" ? total : 0) -
+            (old.payment_method === "cash" ? old.total : 0),
+          qris:
+            (input.payment_method === "qris" ? total : 0) -
+            (old.payment_method === "qris" ? old.total : 0),
+          cost: cost - oldCost,
+          profit: total - cost - oldProfit,
+        },
+        usesDelta,
+      ),
+      { merge: true },
+    );
+
+    // statistik pelanggan: lama dikurangi, baru ditambah (bisa pelanggan yang sama)
+    const counts = (d: Record<string, TransactionDetail>) =>
+      Object.entries(d).map(([pid, x]) => [pid, x.name, x.amount] as const);
+    const custDelta = new Map<
+      string,
+      { spent: number; trx: number; products: Map<string, { name: string; amount: number }> }
+    >();
+    const bump = (
+      cid: string,
+      sign: 1 | -1,
+      t: number,
+      d: Record<string, TransactionDetail>,
+    ) => {
+      const c = custDelta.get(cid) ?? { spent: 0, trx: 0, products: new Map() };
+      c.spent += sign * t;
+      c.trx += sign;
+      for (const [pid, name, amt] of counts(d)) {
+        const p = c.products.get(pid) ?? { name, amount: 0 };
+        p.amount += sign * amt;
+        c.products.set(pid, p);
+      }
+      custDelta.set(cid, c);
+    };
+    if (old.customer_id) bump(old.customer_id, -1, old.total, old.details);
+    if (input.customer_id) bump(input.customer_id, 1, total, details);
+    for (const [cid, c] of custDelta) {
+      if (!custExists.get(cid)) continue;
+      tx.set(
+        doc(db, collections.customers, cid),
+        {
+          total_spent: increment(c.spent),
+          trx_count: increment(c.trx),
+          updated_at: now,
+          product_counts: Object.fromEntries(
+            [...c.products].map(([pid, p]) => [
+              pid,
+              { name: p.name, amount: increment(p.amount) },
+            ]),
+          ),
+        },
+        { merge: true },
+      );
+    }
+  });
+
+  // "terakhir beli" bisa berubah kalau pelanggannya diganti
+  const touched = new Set([ctx.oldCustomer, input.customer_id].filter(Boolean) as string[]);
+  if (ctx.oldCustomer !== input.customer_id) {
+    await Promise.all([...touched].map(refreshLastPurchase));
+  }
 }

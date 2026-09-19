@@ -1,10 +1,12 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Button from "@mui/material/Button";
 import Card from "@mui/material/Card";
 import CardContent from "@mui/material/CardContent";
 import Chip from "@mui/material/Chip";
 import IconButton from "@mui/material/IconButton";
+import Snackbar from "@mui/material/Snackbar";
 import ToggleButton from "@mui/material/ToggleButton";
 import ToggleButtonGroup from "@mui/material/ToggleButtonGroup";
 import Typography from "@mui/material/Typography";
@@ -13,7 +15,7 @@ import WalletIcon from "@mui/icons-material/AccountBalanceWalletOutlined";
 import AddExpenseDialog from "@/components/AddExpenseDialog";
 import EmptyState from "@/components/EmptyState";
 import PageHeader from "@/components/PageHeader";
-import { collections, deleteItem } from "@/lib/db";
+import { collections, deleteItem, rebuildStats } from "@/lib/db";
 import { categoryLabels } from "@/lib/expense";
 import { rupiah } from "@/lib/format";
 import { useByDate } from "@/lib/hooks";
@@ -54,6 +56,8 @@ interface Day {
 export default function CashFlowPage() {
   const [range, setRange] = useState<Range>("7");
   const [addOpen, setAddOpen] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [rebuilding, setRebuilding] = useState(false);
   const start = useMemo(() => startOfRange(range), [range]);
 
   const { items: stats, loading: l1 } = useByDate<DailyStat>(
@@ -85,7 +89,10 @@ export default function CashFlowPage() {
       const date = e.date.toDate();
       get(dayKey(date), date).expenses.push(e);
     }
-    return [...map.values()].sort((a, b) => (a.key < b.key ? 1 : -1));
+    // hari yang hanya berisi angka bahan / sudah nol (mis. transaksi dibatalkan) tidak ditampilkan
+    return [...map.values()]
+      .filter((d) => n(d.stat?.income) > 0 || d.expenses.length > 0)
+      .sort((a, b) => (a.key < b.key ? 1 : -1));
   }, [stats, expenses]);
 
   const totalIn = stats.reduce((s, x) => s + n(x.income), 0);
@@ -249,7 +256,46 @@ export default function CashFlowPage() {
         })}
       </div>
 
+      <div className="mt-8 flex flex-col items-start gap-1">
+        <Button
+          size="small"
+          variant="outlined"
+          disabled={rebuilding}
+          onClick={async () => {
+            if (
+              !window.confirm(
+                "Hitung ulang semua ringkasan harian dan statistik pelanggan dari data transaksi? Ini membaca semua transaksi sekali.",
+              )
+            )
+              return;
+            setRebuilding(true);
+            try {
+              const r = await rebuildStats();
+              setMsg(
+                `Selesai: ${r.transactions} transaksi, ${r.days} hari, ${r.customers} pelanggan`,
+              );
+            } catch {
+              setMsg("Gagal menghitung ulang");
+            } finally {
+              setRebuilding(false);
+            }
+          }}
+        >
+          {rebuilding ? "Menghitung..." : "Hitung ulang ringkasan"}
+        </Button>
+        <Typography variant="caption" color="text.secondary">
+          Membangun ulang ringkasan harian dan statistik pelanggan dari transaksi.
+          Berguna untuk data lama atau kalau angkanya terlihat tidak cocok.
+        </Typography>
+      </div>
+
       <AddExpenseDialog open={addOpen} onClose={() => setAddOpen(false)} />
+      <Snackbar
+        open={!!msg}
+        autoHideDuration={4000}
+        onClose={() => setMsg("")}
+        message={msg}
+      />
     </>
   );
 }

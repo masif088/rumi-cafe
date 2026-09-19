@@ -7,10 +7,13 @@ export default function CategoryFilter({
   categories,
   value,
   onChange,
+  format = (c) => c,
 }: {
   categories: string[];
   value: string;
   onChange: (v: string) => void;
+  /** ubah teks label chip (mis. "A1" -> "Blok A1") */
+  format?: (c: string) => string;
 }) {
   if (categories.length < 2) return null;
   return (
@@ -18,7 +21,7 @@ export default function CategoryFilter({
       {["all", ...categories].map((c) => (
         <Chip
           key={c}
-          label={c === "all" ? "Semua" : c}
+          label={c === "all" ? "Semua" : format(c)}
           color={value === c ? "primary" : "default"}
           variant={value === c ? "filled" : "outlined"}
           onClick={() => onChange(c)}

@@ -32,7 +32,7 @@ import {
 import { rupiah } from "@/lib/format";
 import { useByDate, useCollection } from "@/lib/hooks";
 import { isLow, reasonLabels } from "@/lib/stock";
-import type { Ingredient, IngredientUse, StockReason } from "@/lib/types";
+import type { DailyStat, Ingredient, StockReason } from "@/lib/types";
 
 type Period = "today" | "week" | "month";
 
@@ -73,9 +73,10 @@ export default function BahanPage() {
   const [period, setPeriod] = useState<Period>("month");
 
   const start = useMemo(() => startOf(period), [period]);
-  const { items: uses, loading: usesLoading } = useByDate<IngredientUse>(
-    collections.ingredientUses,
-    "created_at",
+  // pemakaian bahan sudah dijumlahkan per hari di daily_stats (murah dibaca)
+  const { items: days, loading: usesLoading } = useByDate<DailyStat>(
+    collections.dailyStats,
+    "date",
     start,
   );
 
@@ -93,21 +94,20 @@ export default function BahanPage() {
       string,
       { amount: number; value: number; manual: number }
     >();
-    for (const u of uses) {
-      const cur = byIngredient.get(u.ingredient_id) ?? {
-        amount: 0,
-        value: 0,
-        manual: 0,
-      };
-      cur.amount += u.amount;
-      cur.value += u.value;
-      if (u.transaction_id === null) cur.manual += u.amount;
-      byIngredient.set(u.ingredient_id, cur);
+    for (const day of days) {
+      for (const [id, u] of Object.entries(day.uses ?? {})) {
+        const cur = byIngredient.get(id) ?? { amount: 0, value: 0, manual: 0 };
+        cur.amount += u.amount;
+        cur.value += u.value;
+        cur.manual += u.manual;
+        byIngredient.set(id, cur);
+      }
     }
     return [...byIngredient.entries()]
       .map(([id, v]) => ({ id, ing: items.find((i) => i.id === id), ...v }))
+      .filter((r) => r.amount !== 0 || r.value !== 0)
       .sort((a, b) => b.value - a.value);
-  }, [uses, items]);
+  }, [days, items]);
   const reportTotal = report.reduce((s, r) => s + r.value, 0);
   const reportMax = report[0]?.value ?? 0;
 
@@ -235,8 +235,9 @@ export default function BahanPage() {
                   </div>
                   <Button
                     size="small"
+                    variant="outlined"
                     color="inherit"
-                    className="self-start !text-[var(--mui-palette-text-secondary)]"
+                    className="self-start !border-[var(--mui-palette-divider)] !text-[var(--mui-palette-text-secondary)]"
                     onClick={() => setHistoryId(i.id)}
                   >
                     Lihat riwayat beli

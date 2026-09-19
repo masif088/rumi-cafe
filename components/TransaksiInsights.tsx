@@ -10,18 +10,22 @@ import useMediaQuery from "@mui/material/useMediaQuery";
 import { RadarChart } from "@mui/x-charts/RadarChart";
 import { brand } from "@/components/ThemeProvider";
 import { rupiah } from "@/lib/format";
-import type { Customer, Transaction, WithId } from "@/lib/types";
+import type { Customer, DailyStat, WithId } from "@/lib/types";
 
 const DAYS = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"];
 
 type Metric = "revenue" | "count";
 
-/** Tren per hari (radar) dan top pembeli, dari transaksi 30 hari terakhir. */
+/**
+ * Tren per hari (radar) dari ringkasan harian 30 hari terakhir,
+ * dan top pembeli dari total belanja yang tersimpan di dokumen pelanggan.
+ * Keduanya tanpa membaca transaksi satu per satu.
+ */
 export default function TransaksiInsights({
-  items,
+  days,
   customers,
 }: {
-  items: WithId<Transaction>[];
+  days: WithId<DailyStat>[];
   customers: WithId<Customer>[];
 }) {
   const [metric, setMetric] = useState<Metric>("revenue");
@@ -31,38 +35,28 @@ export default function TransaksiInsights({
   const perDay = useMemo(() => {
     const revenue = Array(7).fill(0) as number[];
     const count = Array(7).fill(0) as number[];
-    for (const t of items) {
-      const i = (t.created_at.toDate().getDay() + 6) % 7; // Senin = 0
-      revenue[i] += t.total;
-      count[i] += 1;
+    for (const d of days) {
+      const i = (d.date.toDate().getDay() + 6) % 7; // Senin = 0
+      revenue[i] += d.income ?? 0;
+      count[i] += d.trx_count ?? 0;
     }
     return { revenue, count };
-  }, [items]);
+  }, [days]);
 
-  const topBuyers = useMemo(() => {
-    const byCustomer = new Map<string, { total: number; count: number }>();
-    for (const t of items) {
-      if (!t.customer_id) continue; // pembeli umum tidak dihitung
-      const cur = byCustomer.get(t.customer_id) ?? { total: 0, count: 0 };
-      cur.total += t.total;
-      cur.count += 1;
-      byCustomer.set(t.customer_id, cur);
-    }
-    return [...byCustomer.entries()]
-      .map(([id, v]) => ({
-        id,
-        name: customers.find((c) => c.id === id)?.full_name ?? "Pelanggan",
-        ...v,
-      }))
-      .sort((a, b) => b.total - a.total)
-      .slice(0, 5);
-  }, [items, customers]);
+  const topBuyers = useMemo(
+    () =>
+      customers
+        .filter((c) => (c.total_spent ?? 0) > 0)
+        .sort((a, b) => (b.total_spent ?? 0) - (a.total_spent ?? 0))
+        .slice(0, 5),
+    [customers],
+  );
 
   const data = perDay[metric];
   const peak = Math.max(...data);
   const bestDay = peak > 0 ? DAYS[data.indexOf(peak)] : null;
   const fmt = (v: number) => (metric === "revenue" ? rupiah(v) : `${v} transaksi`);
-  const topMax = topBuyers[0]?.total ?? 0;
+  const topMax = topBuyers[0]?.total_spent ?? 0;
 
   return (
     <div className="mb-5 grid gap-3 md:grid-cols-2">
@@ -88,7 +82,7 @@ export default function TransaksiInsights({
             </ToggleButtonGroup>
           </div>
 
-          {peak === 0 ? (
+          {peak <= 0 ? (
             <Typography
               variant="body2"
               color="text.secondary"
@@ -120,7 +114,7 @@ export default function TransaksiInsights({
           <div>
             <Typography className="!font-bold">Top pembeli</Typography>
             <Typography variant="caption" color="text.secondary">
-              30 hari terakhir, berdasarkan total belanja
+              Sepanjang waktu, berdasarkan total belanja
             </Typography>
           </div>
 
@@ -130,27 +124,27 @@ export default function TransaksiInsights({
             </Typography>
           ) : (
             <ol className="flex flex-col gap-3">
-              {topBuyers.map((b, i) => (
-                <li key={b.id} className="flex flex-col gap-1">
+              {topBuyers.map((c, i) => (
+                <li key={c.id} className="flex flex-col gap-1">
                   <div className="flex items-baseline justify-between gap-2">
                     <Typography className="!truncate !text-sm !font-semibold">
-                      {i + 1}. {b.name}
+                      {i + 1}. {c.full_name}
                     </Typography>
                     <Typography className="!text-sm !font-semibold">
-                      {rupiah(b.total)}
+                      {rupiah(c.total_spent ?? 0)}
                     </Typography>
                   </div>
                   <div className="h-2 overflow-hidden rounded-full bg-[var(--mui-palette-divider)]">
                     <div
                       className="h-full rounded-full"
                       style={{
-                        width: `${topMax ? (b.total / topMax) * 100 : 0}%`,
+                        width: `${topMax ? ((c.total_spent ?? 0) / topMax) * 100 : 0}%`,
                         background: color,
                       }}
                     />
                   </div>
                   <Typography variant="caption" color="text.secondary">
-                    {b.count} transaksi
+                    {c.trx_count ?? 0} transaksi
                   </Typography>
                 </li>
               ))}

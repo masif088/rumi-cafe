@@ -7,6 +7,11 @@ customers
   no_hp
   address
   address_blok
+  total_spent           data berjalan: total belanja (increment saat transaksi)
+  trx_count             data berjalan: jumlah transaksi
+  last_purchase_at      data berjalan: kapan terakhir beli
+  product_counts        data berjalan: { product_id: { name, amount } } untuk "favorit"
+                        (transaksi sebelum fitur ini tidak ikut terhitung)
 
 products
   name
@@ -52,6 +57,8 @@ transactions
                         (transaksi lama tanpa field ini dihitung dari details.hpp)
   details               map, key = product_id:
                           { name, price, amount, hpp }   <- snapshot saat transaksi
+  edited_at             terakhir diedit (created_at tetap waktu asli)
+  status                "void" kalau dibatalkan (+ voided_at, void_reason); data tetap ada
   -> efek: buat ingredient_uses untuk tiap bahan resep,
            ingredients.amount & total_value berkurang
 
@@ -81,6 +88,8 @@ daily_stats             (ringkasan PEMASUKAN harian berjalan; id = "yyyy-mm-dd" 
   cash / qris           pembagian income per metode bayar
   cost / profit         modal & laba kotor
   trx_count             jumlah transaksi
+  uses                  { ingredient_id: { amount, value, manual } } pemakaian bahan hari itu
+                        (manual = penyesuaian stok manual) -> sumber laporan "Bahan terpakai"
   -> ditambah dengan increment() di transaksi Firestore yang sama saat
      createTransaction. Field kosong dianggap 0. Data sebelum fitur ini tidak ikut.
 
@@ -104,3 +113,14 @@ CATATAN / KEPUTUSAN
 - Stok boleh minus (transaksi tidak diblokir), nanti bisa diberi peringatan di UI.
 - Saran nanti: Firestore rules (hanya user login), index untuk
   transactions.created_at.
+
+SUMBER KEBENARAN vs DATA TURUNAN
+- Sumber kebenaran: transactions, expenses, ingredient_uses, ingredient_buys.
+- Data turunan (bisa dibangun ulang kapan saja): daily_stats, statistik di dokumen
+  customers (total_spent, trx_count, last_purchase_at, product_counts).
+- Tombol "Hitung ulang ringkasan" di halaman Cash Flow (rebuildStats di lib/db.ts).
+- Membatalkan transaksi = voidTransaction (stok kembali, angka dikoreksi, riwayat tetap).
+- Cache lokal Firestore aktif (lib/firebase.ts) untuk mengurangi pembacaan.
+- Yang belum: backup JSON (rencana nanti).
+- Edit transaksi = updateTransaction: efek lama dibalik lalu efek baru diterapkan di satu
+  transaksi Firestore; baris produk lama tetap memakai harga/HPP snapshot.
